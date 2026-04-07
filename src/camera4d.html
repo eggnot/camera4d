@@ -43,12 +43,11 @@
         .top {
             top: 30px;
             gap: 8px;
-            background: rgba(255, 255, 255, 0.1);
+            /* background: rgba(0, 0, 0, 0.7); */
             padding: 8px;
             width: fit-content;
             margin: 0 auto;
-            border-radius: 15px;
-            backdrop-filter: blur(10px);
+            /* border-radius: 15px; */
         }
 
         .bottom {
@@ -116,6 +115,33 @@
             background: rgba(255, 59, 48, 0.3);
         }
 
+        #livePreview {
+            position: absolute;
+            display: none;
+            background: #000;
+            pointer-events: none;
+            z-index: 5;
+        }
+
+        #livePreview.pip {
+            display: block;
+            top: 90px;
+            right: 10px;
+            width: 15vmax;
+            border: 2px solid rgba(255, 255, 255, 0.3);
+            border-radius: 8px;
+        }
+
+        #livePreview.ghost {
+            display: block;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+            opacity: 0.5;
+        }
+
         #status {
             position: absolute;
             bottom: 180px;
@@ -137,14 +163,14 @@
 
         <div class="overlay top">
             <select id="fpsSelect">
-                <option value="0.1">0.1 fps</option>
+                <option value="0.5">0.5 fps</option>
                 <option value="1">1 fps</option>
                 <option value="5">5 fps</option>
+                <option value="10">10 fps</option>
                 <option value="15">15 fps</option>
+                <option value="20">20 fps</option>
                 <option value="30" selected>30 fps</option>
                 <option value="60">60 fps</option>
-                <option value="120">120 fps</option>
-                <option value="240">240 fps</option>
             </select>
             <select id="resSelect">
                 <option value="640x480">640x480</option>
@@ -153,20 +179,28 @@
                 <option value="3840x2160">4K</option>
             </select>
             <select id="camSelect">
-                <option value="environment" selected>Rear Cam</option>
-                <option value="user">Front Cam</option>
+                <option value="environment" selected>Rear</option>
+                <option value="user">Front</option>
             </select>
-            <select id="formatSelect">
-                <option value="img-canvas" selected>Standard</option>
-                <option value="img-tiff">TIFF 32</option>
-                <option value="both">Both</option>
+            <select id="previewSelect">
+                <option value="none" selected>No prev</option>
+                <option value="pip">PiP</option>
+                <option value="ghost">Overlay</option>
             </select>
         </div>
 
-        <div id="status">00:00.[0]</div>
+        <div id="status"><span id="time">00:00</span> <span id="frames">[0]</span></div>
+        <video id="livePreview" muted playsinline></video>
 
         <div class="overlay bottom">
             <button id="cancelBtn">✕</button>
+            
+            <select id="formatSelect">
+                <option value="img-canvas" selected>JPEG</option>
+                <option value="img-tiff">TIFF</option>
+                <option value="both">Both</option>
+            </select>
+
             <button id="recordBtn" title="Record"></button>
             <button id="pauseBtn">⏸</button>
         </div>
@@ -306,7 +340,7 @@
           Note: Switching camera/res in [RECORDING/PAUSED] scales the current stack.
         */
         const state_app = {
-            video: document.createElement('video'),
+            video: document.getElementById('livePreview'),
             currentStream: null,
             frameCount: 0,
             isRecording: false,
@@ -318,7 +352,6 @@
             height: 0,
             textures: [],
             framebuffers: [],
-            currentT: 0, // Ping-pong index
             renderStarted: false,
             targetFPS: 30,
             lastAccumTime: 0
@@ -344,7 +377,7 @@
 
         // --- RENDER MODULE (WebGL & Camera) ---
 
-        const ui = ["canvas", "status", "recordBtn", "camSelect", "cancelBtn", "pauseBtn", "resSelect", "fpsSelect", "formatSelect"]
+        const ui = ["canvas", "status", "time", "frames", "recordBtn", "camSelect", "cancelBtn", "pauseBtn", "resSelect", "fpsSelect", "formatSelect", "previewSelect", "livePreview"]
             .reduce((acc, id) => ({ ...acc, [id]: document.getElementById(id === 'canvas' ? 'glCanvas' : id) }), {});
 
         const gl = ui.canvas.getContext('webgl2', { preserveDrawingBuffer: true, alpha: false });
@@ -352,6 +385,11 @@
         if (!gl.getExtension('EXT_color_buffer_float')) {
             alert("Your browser doesn't support 32-bit float textures!");
         }
+
+        const render_camTex = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, render_camTex);
+        [gl.TEXTURE_MIN_FILTER, gl.TEXTURE_MAG_FILTER].forEach(f => gl.texParameteri(gl.TEXTURE_2D, f, gl.LINEAR));
+        [gl.TEXTURE_WRAP_S, gl.TEXTURE_WRAP_T].forEach(w => gl.texParameteri(gl.TEXTURE_2D, w, gl.CLAMP_TO_EDGE));
 
         const vs = `#version 300 es
         in vec2 position;
@@ -364,14 +402,10 @@
         const fsAccum = `#version 300 es
         precision highp float;
         uniform sampler2D camera;
-        uniform sampler2D prevSum;
-        uniform bool isRecording;
         in vec2 vTexCoord;
         out vec4 outColor;
         void main() {
-            vec4 cam = texture(camera, vec2(vTexCoord.x, 1.0 - vTexCoord.y));
-            vec4 prev = texture(prevSum, vTexCoord);
-            outColor = isRecording ? (prev + cam) : vec4(cam.rgb, 1.0);
+            outColor = texture(camera, vec2(vTexCoord.x, 1.0 - vTexCoord.y));
         }`;
 
         const fsDisplay = `#version 300 es
@@ -381,8 +415,7 @@
         in vec2 vTexCoord;
         out vec4 outColor;
         void main() {
-            vec4 sum = texture(sum, vTexCoord);
-            outColor = vec4(sum.rgb / max(count, 1.0), 1.0);
+            outColor = vec4(texture(sum, vTexCoord).rgb / max(count, 1.0), 1.0);
         }`;
 
         const render_createShader = (type, source) => {
@@ -406,9 +439,7 @@
 
         const progAccum = render_createProgram(vs, fsAccum);
         progAccum.uniforms = {
-            camera: gl.getUniformLocation(progAccum.id, "camera"),
-            prevSum: gl.getUniformLocation(progAccum.id, "prevSum"),
-            isRecording: gl.getUniformLocation(progAccum.id, "isRecording")
+            camera: gl.getUniformLocation(progAccum.id, "camera")
         };
 
         const progDisp = render_createProgram(vs, fsDisplay);
@@ -429,28 +460,23 @@
         const render_initTextures = (w, h) => {
             const oldW = state_app.width;
             const oldH = state_app.height;
-            const oldFB = state_app.framebuffers[state_app.currentT];
-            const newTextures = [];
-            const newFBs = [];
+            const oldFB = state_app.framebuffers[0];
 
-            for (let i = 0; i < 2; i++) {
-                const tex = gl.createTexture();
-                gl.bindTexture(gl.TEXTURE_2D, tex);
-                gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, w, h, 0, gl.RGBA, gl.FLOAT, null);
-                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-                newTextures.push(tex);
+            const tex = gl.createTexture();
+            gl.bindTexture(gl.TEXTURE_2D, tex);
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, w, h, 0, gl.RGBA, gl.FLOAT, null);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
 
-                const fb = gl.createFramebuffer();
-                gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
-                gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
-                newFBs.push(fb);
-            }
+            const fb = gl.createFramebuffer();
+            gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+            gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+            gl.clear(gl.COLOR_BUFFER_BIT);
 
             // If we have existing data and are recording, copy it to the new buffer
             if (oldFB && state_app.isRecording) {
                 gl.bindFramebuffer(gl.READ_FRAMEBUFFER, oldFB);
-                gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, newFBs[0]);
+                gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, fb);
                 gl.blitFramebuffer(
                     0, 0, oldW, oldH,
                     0, 0, w, h,
@@ -461,9 +487,8 @@
 
             state_app.textures.forEach(t => gl.deleteTexture(t));
             state_app.framebuffers.forEach(f => gl.deleteFramebuffer(f));
-            state_app.textures = newTextures;
-            state_app.framebuffers = newFBs;
-            state_app.currentT = 0;
+            state_app.textures = [tex];
+            state_app.framebuffers = [fb];
             state_app.width = w;
             state_app.height = h;
         };
@@ -536,7 +561,7 @@
             if (!state_app.renderStarted) { state_app.renderStarted = true; requestAnimationFrame(render_loop); }
         });
 
-        const ui_formatTime = (ms, frames) => {
+        const ui_formatTime = (ms) => {
             const s = Math.floor(ms / 1000);
             const h = Math.floor(s / 3600);
             const m = Math.floor((s % 3600) / 60);
@@ -545,7 +570,7 @@
             if (h > 0) parts.push(h.toString().padStart(2, '0'));
             parts.push(m.toString().padStart(2, '0'));
             parts.push(sec.toString().padStart(2, '0'));
-            return parts.join(':') + ` [${frames}]`;
+            return parts.join(':');
         };
 
         /**
@@ -563,41 +588,49 @@
             }
             state_app.lastFrameTime = now;
 
-            gl.viewport(0, 0, state_app.width, state_app.height);
-            gl.bindTexture(gl.TEXTURE_2D, render_camTex);
-            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, state_app.video);
-
             const msPerFrame = 1000 / state_app.targetFPS;
             if (now - state_app.lastAccumTime >= msPerFrame) {
+                gl.viewport(0, 0, state_app.width, state_app.height);
+                gl.bindTexture(gl.TEXTURE_2D, render_camTex);
+                gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, state_app.video);
+
                 if ((state_app.isRecording && !state_app.isPaused) || state_app.frameCount === 0) {
-                    let nextT = 1 - state_app.currentT;
-                    gl.bindFramebuffer(gl.FRAMEBUFFER, state_app.framebuffers[nextT]);
+                    gl.bindFramebuffer(gl.FRAMEBUFFER, state_app.framebuffers[0]);
+                    
+                    // Use hardware blending for accumulation
+                    if (state_app.isRecording && !state_app.isPaused && state_app.frameCount > 0) {
+                        gl.enable(gl.BLEND);
+                        gl.blendFunc(gl.ONE, gl.ONE);
+                    } else {
+                        gl.disable(gl.BLEND);
+                    }
+
                     gl.useProgram(progAccum.id);
                     gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, render_camTex);
-                    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, state_app.textures[state_app.currentT]);
                     gl.uniform1i(progAccum.uniforms.camera, 0);
-                    gl.uniform1i(progAccum.uniforms.prevSum, 1);
-                    gl.uniform1i(progAccum.uniforms.isRecording, state_app.isRecording);
 
                     gl.enableVertexAttribArray(progAccum.attribs.position);
                     gl.bindBuffer(gl.ARRAY_BUFFER, render_quadBuffer);
                     gl.vertexAttribPointer(progAccum.attribs.position, 2, gl.FLOAT, false, 0, 0);
                     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+                    gl.disable(gl.BLEND);
 
-                    if (state_app.isRecording) state_app.frameCount++;
-                    state_app.currentT = nextT;
+                    if (state_app.isRecording && !state_app.isPaused) state_app.frameCount++;
                 }
+
+                ui.time.innerText = ui_formatTime(state_app.elapsedTime);
+                ui.frames.innerText = ` [${state_app.frameCount}]`;
                 state_app.lastAccumTime = now;
             }
 
+            gl.viewport(0, 0, state_app.width, state_app.height);
             gl.bindFramebuffer(gl.FRAMEBUFFER, null);
             gl.useProgram(progDisp.id);
-            gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, state_app.textures[state_app.currentT]);
+            gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, state_app.textures[0]);
             gl.uniform1i(progDisp.uniforms.sum, 0);
             gl.uniform1f(progDisp.uniforms.count, Math.max(state_app.frameCount, 1.0));
             gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 
-            ui.status.innerText = ui_formatTime(state_app.elapsedTime, state_app.frameCount);
             requestAnimationFrame(render_loop);
 
         };
@@ -607,13 +640,14 @@
          */
         const io_saveResult = async () => {
             const frames = state_app.frameCount;
+            if (frames === 0) return state_resetToPreview();
             const fmt = ui.formatSelect.value;
             const name = `${state_app.startTimeStr} (${frames}f)`;
             ui.recordBtn.style.opacity = "0.3";
 
             if (fmt === fmt_imgTiff || fmt === 'both') {
                 const data = new Float32Array(state_app.width * state_app.height * 4);
-                gl.bindFramebuffer(gl.FRAMEBUFFER, state_app.framebuffers[state_app.currentT]);
+                gl.bindFramebuffer(gl.FRAMEBUFFER, state_app.framebuffers[0]);
                 gl.readPixels(0, 0, state_app.width, state_app.height, gl.RGBA, gl.FLOAT, data);
                 const tiff = io_createTiff16(state_app.width, state_app.height, data, Math.max(frames, 1));
                 const a = document.createElement('a');
@@ -626,11 +660,6 @@
 
             state_resetToPreview();
         };
-
-        const render_camTex = gl.createTexture();
-        gl.bindTexture(gl.TEXTURE_2D, render_camTex);
-        [gl.TEXTURE_MIN_FILTER, gl.TEXTURE_MAG_FILTER].forEach(f => gl.texParameteri(gl.TEXTURE_2D, f, gl.LINEAR));
-        [gl.TEXTURE_WRAP_S, gl.TEXTURE_WRAP_T].forEach(w => gl.texParameteri(gl.TEXTURE_2D, w, gl.CLAMP_TO_EDGE));
 
         ui.recordBtn.addEventListener('click', async () => {
             if (state_app.frameCount > 0 && !state_app.isRecording) return io_saveResult();
@@ -647,6 +676,12 @@
         });
 
         ui.cancelBtn.addEventListener('click', state_resetToPreview);
+
+        ui.previewSelect.addEventListener('change', () => {
+            const mode = ui.previewSelect.value;
+            ui.livePreview.className = mode === 'none' ? '' : mode;
+            ui.livePreview.style.display = mode === 'none' ? 'none' : 'block';
+        });
 
     </script>
 </body>
