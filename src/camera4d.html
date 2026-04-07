@@ -136,6 +136,16 @@
         <canvas id="glCanvas"></canvas>
 
         <div class="overlay top">
+            <select id="fpsSelect">
+                <option value="0.1">0.1 fps</option>
+                <option value="1">1 fps</option>
+                <option value="5">5 fps</option>
+                <option value="15">15 fps</option>
+                <option value="30" selected>30 fps</option>
+                <option value="60">60 fps</option>
+                <option value="120">120 fps</option>
+                <option value="240">240 fps</option>
+            </select>
             <select id="resSelect">
                 <option value="640x480">640x480</option>
                 <option value="1280x720" selected>720p</option>
@@ -309,7 +319,9 @@
             textures: [],
             framebuffers: [],
             currentT: 0, // Ping-pong index
-            renderStarted: false
+            renderStarted: false,
+            targetFPS: 30,
+            lastAccumTime: 0
         };
 
         /** Resets the app back to live viewfinder mode */
@@ -332,7 +344,7 @@
 
         // --- RENDER MODULE (WebGL & Camera) ---
 
-        const ui = ["canvas", "status", "recordBtn", "camSelect", "cancelBtn", "pauseBtn", "resSelect", "formatSelect"]
+        const ui = ["canvas", "status", "recordBtn", "camSelect", "cancelBtn", "pauseBtn", "resSelect", "fpsSelect", "formatSelect"]
             .reduce((acc, id) => ({ ...acc, [id]: document.getElementById(id === 'canvas' ? 'glCanvas' : id) }), {});
 
         const gl = ui.canvas.getContext('webgl2', { preserveDrawingBuffer: true, alpha: false });
@@ -461,17 +473,40 @@
          */
         const render_startCamera = async () => {
             if (state_app.currentStream) state_app.currentStream.getTracks().forEach(t => t.stop());
-            const [w, h] = ui.resSelect.value.split('x').map(Number);
+            const [reqW, reqH] = ui.resSelect.value.split('x').map(Number);
+            const reqFPS = parseFloat(ui.fpsSelect.value);
+
             try {
                 state_app.currentStream = await navigator.mediaDevices.getUserMedia({
                     video: {
                         facingMode: ui.camSelect.value,
-                        width: { ideal: w },
-                        height: { ideal: h },
-                        frameRate: { min: 5, ideal: 30, max: 60 }
+                        width: { ideal: reqW },
+                        height: { ideal: reqH },
+                        frameRate: { ideal: reqFPS }
                     },
                     audio: false
                 });
+
+                const track = state_app.currentStream.getVideoTracks()[0];
+                const settings = track.getSettings();
+
+                // Resolution UI Update
+                const actW = settings.width || reqW, actH = settings.height || reqH;
+                const isResDiff = actW !== reqW || actH !== reqH;
+                ui.resSelect.options[ui.resSelect.selectedIndex].text = `${actW}x${actH}${isResDiff ? '*' : ''}`;
+
+                // Framerate UI Update & Logic
+                const actFPS = settings.frameRate || reqFPS;
+                if (actFPS < reqFPS - 0.1) {
+                    // Hardware is slower than requested
+                    ui.fpsSelect.options[ui.fpsSelect.selectedIndex].text = `${actFPS.toFixed(2)}* fps`;
+                    state_app.targetFPS = actFPS;
+                } else {
+                    // Hardware matches or is faster (we will throttle in software)
+                    ui.fpsSelect.options[ui.fpsSelect.selectedIndex].text = `${reqFPS} fps`;
+                    state_app.targetFPS = reqFPS;
+                }
+
                 state_app.video.srcObject = state_app.currentStream;
                 state_app.video.load();
                 // Attempt to play, but handle potential autoplay policy issues
@@ -490,6 +525,7 @@
         window.addEventListener('load', render_startCamera);
         ui.camSelect.addEventListener('change', () => { if (!state_app.isRecording) state_resetToPreview(); render_startCamera(); });
         ui.resSelect.addEventListener('change', () => { if (!state_app.isRecording) state_resetToPreview(); render_startCamera(); });
+        ui.fpsSelect.addEventListener('change', () => { if (!state_app.isRecording) state_resetToPreview(); render_startCamera(); });
 
         state_app.video.addEventListener('loadedmetadata', () => {
             const vW = state_app.video.videoWidth, vH = state_app.video.videoHeight;
@@ -531,23 +567,27 @@
             gl.bindTexture(gl.TEXTURE_2D, render_camTex);
             gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, state_app.video);
 
-            if ((state_app.isRecording && !state_app.isPaused) || state_app.frameCount === 0) {
-                let nextT = 1 - state_app.currentT;
-                gl.bindFramebuffer(gl.FRAMEBUFFER, state_app.framebuffers[nextT]);
-                gl.useProgram(progAccum.id);
-                gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, render_camTex);
-                gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, state_app.textures[state_app.currentT]);
-                gl.uniform1i(progAccum.uniforms.camera, 0);
-                gl.uniform1i(progAccum.uniforms.prevSum, 1);
-                gl.uniform1i(progAccum.uniforms.isRecording, state_app.isRecording);
+            const msPerFrame = 1000 / state_app.targetFPS;
+            if (now - state_app.lastAccumTime >= msPerFrame) {
+                if ((state_app.isRecording && !state_app.isPaused) || state_app.frameCount === 0) {
+                    let nextT = 1 - state_app.currentT;
+                    gl.bindFramebuffer(gl.FRAMEBUFFER, state_app.framebuffers[nextT]);
+                    gl.useProgram(progAccum.id);
+                    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, render_camTex);
+                    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, state_app.textures[state_app.currentT]);
+                    gl.uniform1i(progAccum.uniforms.camera, 0);
+                    gl.uniform1i(progAccum.uniforms.prevSum, 1);
+                    gl.uniform1i(progAccum.uniforms.isRecording, state_app.isRecording);
 
-                gl.enableVertexAttribArray(progAccum.attribs.position);
-                gl.bindBuffer(gl.ARRAY_BUFFER, render_quadBuffer);
-                gl.vertexAttribPointer(progAccum.attribs.position, 2, gl.FLOAT, false, 0, 0);
-                gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+                    gl.enableVertexAttribArray(progAccum.attribs.position);
+                    gl.bindBuffer(gl.ARRAY_BUFFER, render_quadBuffer);
+                    gl.vertexAttribPointer(progAccum.attribs.position, 2, gl.FLOAT, false, 0, 0);
+                    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 
-                if (state_app.isRecording) state_app.frameCount++;
-                state_app.currentT = nextT;
+                    if (state_app.isRecording) state_app.frameCount++;
+                    state_app.currentT = nextT;
+                }
+                state_app.lastAccumTime = now;
             }
 
             gl.bindFramebuffer(gl.FRAMEBUFFER, null);
@@ -596,7 +636,7 @@
             if (state_app.frameCount > 0 && !state_app.isRecording) return io_saveResult();
             if (state_app.isRecording) return state_stopAndFreeze();
             state_app.isRecording = true; state_app.isPaused = false; state_app.frameCount = 0; state_app.elapsedTime = 0;
-            state_app.lastFrameTime = performance.now();
+            state_app.lastFrameTime = state_app.lastAccumTime = performance.now();
             state_app.startTimeStr = new Date().toISOString().replace(/T/, ' ').replace(/\..+/, '').replace(/:/g, '-');
             ui.recordBtn.classList.add('recording'); ui.cancelBtn.style.display = 'block'; ui.pauseBtn.style.display = 'block';
             state_app.framebuffers.forEach(fb => { gl.bindFramebuffer(gl.FRAMEBUFFER, fb); gl.clear(gl.COLOR_BUFFER_BIT); });
