@@ -1,0 +1,614 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Raw Stacker</title>
+    <style>
+        body {
+            margin: 0;
+            background: #000;
+            color: #fff;
+            font-family: sans-serif;
+            overflow: hidden;
+            touch-action: none;
+        }
+
+        .viewport-container {
+            position: relative;
+            width: 100vw;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+
+        canvas {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+            background: #111;
+        }
+
+        .overlay {
+            position: absolute;
+            left: 0;
+            right: 0;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            pointer-events: none;
+        }
+
+        .top {
+            top: 30px;
+            gap: 8px;
+            background: rgba(255, 255, 255, 0.1);
+            padding: 8px;
+            width: fit-content;
+            margin: 0 auto;
+            border-radius: 15px;
+            backdrop-filter: blur(10px);
+        }
+
+        .bottom {
+            bottom: 60px;
+            gap: 30px;
+        }
+
+        .overlay>* {
+            pointer-events: auto;
+        }
+
+        select,
+        .btn-small {
+            padding: 8px;
+            font-size: 10pt;
+            border-radius: 5px;
+            background: rgba(0, 0, 0, 0.6);
+            color: white;
+            border: 1px solid #555;
+            height: 36px;
+        }
+
+        button {
+            border: none;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        #recordBtn {
+            width: 70px;
+            height: 70px;
+            border-radius: 50%;
+            background: #ff3b30;
+            border: 5px solid #fff;
+            transition: all 0.2s;
+        }
+
+        #recordBtn.recording {
+            border-radius: 15%;
+            transform: scale(0.8);
+        }
+
+        #recordBtn.result {
+            background: #2ecc71;
+            border-color: #fff;
+        }
+
+        /* Green for 'Save' mode */
+
+        #cancelBtn,
+        #pauseBtn {
+            background: rgba(255, 255, 255, 0.2);
+            color: white;
+            width: 50px;
+            height: 50px;
+            border-radius: 50%;
+            font-size: 18pt;
+            display: none;
+        }
+
+        #cancelBtn {
+            display: none;
+            background: rgba(255, 59, 48, 0.3);
+        }
+
+        #status {
+            position: absolute;
+            bottom: 180px;
+            width: 100%;
+            text-align: center;
+            font-family: monospace;
+            font-size: 16px;
+            color: #fff;
+            text-shadow: 0 1px 3px #000;
+            pointer-events: none;
+        }
+    </style>
+</head>
+
+<body>
+
+    <div class="viewport-container">
+        <canvas id="glCanvas"></canvas>
+
+        <div class="overlay top">
+            <select id="resSelect">
+                <option value="640x480">640x480</option>
+                <option value="1280x720" selected>720p</option>
+                <option value="1920x1080">1080p</option>
+                <option value="3840x2160">4K</option>
+            </select>
+            <select id="camSelect">
+                <option value="environment" selected>Rear Cam</option>
+                <option value="user">Front Cam</option>
+            </select>
+            <select id="formatSelect">
+                <option value="img-canvas" selected>Standard</option>
+                <option value="img-tiff">TIFF 32</option>
+                <option value="both">Both</option>
+            </select>
+        </div>
+
+        <div id="status">00:00.[0]</div>
+
+        <div class="overlay bottom">
+            <button id="cancelBtn">✕</button>
+            <button id="recordBtn" title="Record"></button>
+            <button id="pauseBtn">⏸</button>
+        </div>
+    </div>
+
+    <script>
+        // --- FORMAT CONSTANTS ---
+        const fmt_imgTiff = 'img-tiff';
+        const fmt_imgCanvas = 'img-canvas';
+
+        const fmt_imgCanvasType = 'jpeg'; // webp, jpeg, png
+
+        // --- IO MODULE (Data Encoding & File Operations) ---
+
+        /**
+         * Unified TIFF encoder for 16-bit Int (compatible with Google Photos) and 32-bit Float.
+         * @param {number} width - Image width
+         * @param {number} height - Image height
+         * @param {Float32Array} rgbaData - Raw pixel data
+         * @param {Object} options - Encoding parameters
+         * @returns {ArrayBuffer}
+         */
+        const io_encodeTiff = (width, height, rgbaData, { denominator = 1, bitsPerSample = 32, sampleFormat = 3, gamma = 1.0 } = {}) => {
+            const bytesPerChannel = bitsPerSample / 8;
+            const numPixels = width * height;
+            const pixelDataSize = numPixels * 3 * bytesPerChannel;
+            const bpsSize = 3 * 2;
+            const sfSize = 3 * 2;
+            const ifdEntryCount = 10;
+            const ifdSize = 2 + (ifdEntryCount * 12) + 4;
+
+            const totalSize = 8 + pixelDataSize + bpsSize + sfSize + ifdSize;
+            const buffer = new ArrayBuffer(totalSize);
+            const view = new DataView(buffer);
+            let offset = 0;
+
+            // 1. Header (Little Endian "II")
+            view.setUint16(offset, 0x4949, true); offset += 2;
+            view.setUint16(offset, 42, true); offset += 2;
+            const ifdOffsetPos = offset; offset += 4;
+
+            // 2. Pixel Data (RGB, Y-Flipped for standard orientation)
+            const pixelDataOffset = offset;
+            const invGamma = 1.0 / gamma;
+            const is16 = bitsPerSample === 16;
+
+            for (let y = 0; y < height; y++) {
+                for (let x = 0; x < width; x++) {
+                    const srcIdx = ((height - 1 - y) * width + x) * 4;
+                    for (let c = 0; c < 3; c++) {
+                        let val = rgbaData[srcIdx + c] / denominator;
+                        if (gamma !== 1.0) val = Math.pow(Math.max(0, val), invGamma);
+
+                        if (is16) {
+                            view.setUint16(offset, Math.max(0, Math.min(65535, val * 65535)), true);
+                            offset += 2;
+                        } else {
+                            view.setFloat32(offset, val, true);
+                            offset += 4;
+                        }
+                    }
+                }
+            }
+
+            // 3. Metadata Arrays (Offsets used by Tags)
+            const bpsOffset = offset;
+            for (let i = 0; i < 3; i++) { view.setUint16(offset, bitsPerSample, true); offset += 2; }
+
+            const sfOffset = offset;
+            for (let i = 0; i < 3; i++) { view.setUint16(offset, sampleFormat, true); offset += 2; }
+
+            // 4. Image File Directory (IFD)
+            const ifdStart = offset;
+            view.setUint32(ifdOffsetPos, ifdStart, true);
+            view.setUint16(offset, ifdEntryCount, true); offset += 2;
+
+            const writeTag = (tag, type, count, valOrOffset) => {
+                view.setUint16(offset, tag, true);
+                view.setUint16(offset + 2, type, true);
+                view.setUint32(offset + 4, count, true);
+                view.setUint32(offset + 8, valOrOffset, true);
+                offset += 12;
+            };
+
+            writeTag(256, 4, 1, width);
+            writeTag(257, 4, 1, height);
+            writeTag(258, 3, 3, bpsOffset);
+            writeTag(259, 3, 1, 1);
+            writeTag(262, 3, 1, 2);
+            writeTag(273, 4, 1, pixelDataOffset);
+            writeTag(277, 3, 1, 3);
+            writeTag(278, 4, 1, height);
+            writeTag(279, 4, 1, pixelDataSize);
+            writeTag(339, 3, 3, sfOffset);
+            view.setUint32(offset, 0, true);
+            return buffer;
+        };
+
+        /** @returns {ArrayBuffer} 16-bit TIFF with gamma 2.2 */
+        const io_createTiff16 = (width, height, rgbaData, denominator = 1) =>
+            io_encodeTiff(width, height, rgbaData, { denominator, bitsPerSample: 16, sampleFormat: 1, gamma: 2.2 });
+
+        /** @returns {ArrayBuffer} 32-bit Float Linear TIFF */
+        const io_createTiff32 = (width, height, rgbaData, denominator = 1) =>
+            io_encodeTiff(width, height, rgbaData, { denominator, bitsPerSample: 32, sampleFormat: 3, gamma: 1.0 });
+
+
+        /**
+         * Saves the current canvas state as image.
+         * @param {HTMLCanvasElement} canvas 
+         * @param {string} filename 
+         */
+        const io_saveCanvasImage = (canvas, filename) => {
+            return new Promise(resolve => {
+                canvas.toBlob(blob => {
+                    if (blob) {
+                        const url = URL.createObjectURL(blob);
+                        const a = document.createElement('a');
+                        a.href = url; a.download = filename; a.click();
+                        setTimeout(() => URL.revokeObjectURL(url), 1000);
+                    }
+                    resolve();
+                }, `image/${fmt_imgCanvasType}`, 1.0);
+            });
+        };
+
+        // --- STATE MODULE (App Logic & Lifecycle) ---
+
+        /*
+          APP STATE GRAPH:
+          [IDLE] --------(Record Click)------ [RECORDING]
+          [RECORDING] ---(Pause Click)------- [PAUSED]
+          [PAUSED] ------(Pause Click)------- [RECORDING]
+          [RECORDING/PAUSED] --(Stop Click)-- [RESULT]
+          [RESULT] ------(Save/Cancel)------- [IDLE]
+    
+          Note: Switching camera/res in [RECORDING/PAUSED] scales the current stack.
+        */
+        const state_app = {
+            video: document.createElement('video'),
+            currentStream: null,
+            frameCount: 0,
+            isRecording: false,
+            isPaused: false,
+            elapsedTime: 0,
+            lastFrameTime: 0,
+            startTimeStr: "",
+            width: 0,
+            height: 0,
+            textures: [],
+            framebuffers: [],
+            currentT: 0, // Ping-pong index
+            renderStarted: false
+        };
+
+        /** Resets the app back to live viewfinder mode */
+        const state_resetToPreview = () => {
+            state_app.isRecording = state_app.isPaused = false;
+            state_app.frameCount = state_app.elapsedTime = 0;
+            ui.recordBtn.className = "";
+            ui.recordBtn.style.opacity = "1";
+            ui.cancelBtn.style.display = ui.pauseBtn.style.display = 'none';
+            ui.pauseBtn.innerText = "⏸";
+        };
+
+        /** Freezes the current stack and prepares for saving */
+        const state_stopAndFreeze = () => {
+            state_app.isRecording = false;
+            ui.recordBtn.classList.remove('recording');
+            ui.recordBtn.classList.add('result');
+            ui.pauseBtn.style.display = 'none';
+        };
+
+        // --- RENDER MODULE (WebGL & Camera) ---
+
+        const ui = ["canvas", "status", "recordBtn", "camSelect", "cancelBtn", "pauseBtn", "resSelect", "formatSelect"]
+            .reduce((acc, id) => ({ ...acc, [id]: document.getElementById(id === 'canvas' ? 'glCanvas' : id) }), {});
+
+        const gl = ui.canvas.getContext('webgl2', { preserveDrawingBuffer: true, alpha: false });
+
+        if (!gl.getExtension('EXT_color_buffer_float')) {
+            alert("Your browser doesn't support 32-bit float textures!");
+        }
+
+        const vs = `#version 300 es
+        in vec2 position;
+        out vec2 vTexCoord;
+        void main() {
+            vTexCoord = (position + 1.0) / 2.0;
+            gl_Position = vec4(position, 0.0, 1.0);
+        }`;
+
+        const fsAccum = `#version 300 es
+        precision highp float;
+        uniform sampler2D camera;
+        uniform sampler2D prevSum;
+        uniform bool isRecording;
+        in vec2 vTexCoord;
+        out vec4 outColor;
+        void main() {
+            vec4 cam = texture(camera, vec2(vTexCoord.x, 1.0 - vTexCoord.y));
+            vec4 prev = texture(prevSum, vTexCoord);
+            outColor = isRecording ? (prev + cam) : vec4(cam.rgb, 1.0);
+        }`;
+
+        const fsDisplay = `#version 300 es
+        precision highp float;
+        uniform sampler2D sum;
+        uniform float count;
+        in vec2 vTexCoord;
+        out vec4 outColor;
+        void main() {
+            vec4 sum = texture(sum, vTexCoord);
+            outColor = vec4(sum.rgb / max(count, 1.0), 1.0);
+        }`;
+
+        const render_createShader = (type, source) => {
+            const s = gl.createShader(type);
+            gl.shaderSource(s, source);
+            gl.compileShader(s);
+            return s;
+        };
+
+        const render_createProgram = (vsSrc, fsSrc) => {
+            const p = gl.createProgram();
+            gl.attachShader(p, render_createShader(gl.VERTEX_SHADER, vsSrc));
+            gl.attachShader(p, render_createShader(gl.FRAGMENT_SHADER, fsSrc));
+            gl.linkProgram(p);
+            return {
+                id: p,
+                attribs: { position: gl.getAttribLocation(p, "position") },
+                uniforms: {}
+            };
+        };
+
+        const progAccum = render_createProgram(vs, fsAccum);
+        progAccum.uniforms = {
+            camera: gl.getUniformLocation(progAccum.id, "camera"),
+            prevSum: gl.getUniformLocation(progAccum.id, "prevSum"),
+            isRecording: gl.getUniformLocation(progAccum.id, "isRecording")
+        };
+
+        const progDisp = render_createProgram(vs, fsDisplay);
+        progDisp.uniforms = {
+            sum: gl.getUniformLocation(progDisp.id, "sum"),
+            count: gl.getUniformLocation(progDisp.id, "count")
+        };
+
+        const render_quadBuffer = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, render_quadBuffer);
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+
+        /**
+         * Manages WebGL texture lifecycle and handles scaling via blit.
+         * @param {number} w - Target width
+         * @param {number} h - Target height
+         */
+        const render_initTextures = (w, h) => {
+            const oldW = state_app.width;
+            const oldH = state_app.height;
+            const oldFB = state_app.framebuffers[state_app.currentT];
+            const newTextures = [];
+            const newFBs = [];
+
+            for (let i = 0; i < 2; i++) {
+                const tex = gl.createTexture();
+                gl.bindTexture(gl.TEXTURE_2D, tex);
+                gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, w, h, 0, gl.RGBA, gl.FLOAT, null);
+                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+                newTextures.push(tex);
+
+                const fb = gl.createFramebuffer();
+                gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+                gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+                newFBs.push(fb);
+            }
+
+            // If we have existing data and are recording, copy it to the new buffer
+            if (oldFB && state_app.isRecording) {
+                gl.bindFramebuffer(gl.READ_FRAMEBUFFER, oldFB);
+                gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, newFBs[0]);
+                gl.blitFramebuffer(
+                    0, 0, oldW, oldH,
+                    0, 0, w, h,
+                    gl.COLOR_BUFFER_BIT, gl.LINEAR
+                );
+                gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+            }
+
+            state_app.textures.forEach(t => gl.deleteTexture(t));
+            state_app.framebuffers.forEach(f => gl.deleteFramebuffer(f));
+            state_app.textures = newTextures;
+            state_app.framebuffers = newFBs;
+            state_app.currentT = 0;
+            state_app.width = w;
+            state_app.height = h;
+        };
+
+        /**
+         * Initializes or switches the camera stream.
+         */
+        const render_startCamera = async () => {
+            if (state_app.currentStream) state_app.currentStream.getTracks().forEach(t => t.stop());
+            const [w, h] = ui.resSelect.value.split('x').map(Number);
+            try {
+                state_app.currentStream = await navigator.mediaDevices.getUserMedia({
+                    video: {
+                        facingMode: ui.camSelect.value,
+                        width: { ideal: w },
+                        height: { ideal: h },
+                        frameRate: { min: 5, ideal: 30, max: 60 }
+                    },
+                    audio: false
+                });
+                state_app.video.srcObject = state_app.currentStream;
+                state_app.video.load();
+                // Attempt to play, but handle potential autoplay policy issues
+                try {
+                    await state_app.video.play();
+                } catch (playError) {
+                    console.warn("Video autoplay blocked:", playError);
+                    // The WebGL canvas can still pull frames even if the HTML video element isn't visually playing.
+                    // No need for an explicit user prompt here, as the canvas will show the preview.
+                }
+            } catch (e) {
+                alert("Camera failed: " + e.message);
+            }
+        };
+
+        window.addEventListener('load', render_startCamera);
+        ui.camSelect.addEventListener('change', () => { if (!state_app.isRecording) state_resetToPreview(); render_startCamera(); });
+        ui.resSelect.addEventListener('change', () => { if (!state_app.isRecording) state_resetToPreview(); render_startCamera(); });
+
+        state_app.video.addEventListener('loadedmetadata', () => {
+            const vW = state_app.video.videoWidth, vH = state_app.video.videoHeight;
+            if (vW !== state_app.width || vH !== state_app.height) {
+                ui.canvas.width = vW; ui.canvas.height = vH;
+                render_initTextures(vW, vH);
+            }
+            if (!state_app.renderStarted) { state_app.renderStarted = true; requestAnimationFrame(render_loop); }
+        });
+
+        const ui_formatTime = (ms, frames) => {
+            const s = Math.floor(ms / 1000);
+            const h = Math.floor(s / 3600);
+            const m = Math.floor((s % 3600) / 60);
+            const sec = s % 60;
+            const parts = [];
+            if (h > 0) parts.push(h.toString().padStart(2, '0'));
+            parts.push(m.toString().padStart(2, '0'));
+            parts.push(sec.toString().padStart(2, '0'));
+            return parts.join(':') + ` [${frames}]`;
+        };
+
+        /**
+         * The main WebGL render and accumulation loop.
+         */
+        const render_loop = () => {
+            if (!state_app.width || !state_app.height || state_app.video.readyState < 2 || state_app.video.videoWidth === 0) {
+                return requestAnimationFrame(render_loop);
+            }
+
+            const now = performance.now();
+
+            if (state_app.isRecording && !state_app.isPaused) {
+                state_app.elapsedTime += (state_app.lastFrameTime ? now - state_app.lastFrameTime : 0);
+            }
+            state_app.lastFrameTime = now;
+
+            gl.viewport(0, 0, state_app.width, state_app.height);
+            gl.bindTexture(gl.TEXTURE_2D, render_camTex);
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, state_app.video);
+
+            if ((state_app.isRecording && !state_app.isPaused) || state_app.frameCount === 0) {
+                let nextT = 1 - state_app.currentT;
+                gl.bindFramebuffer(gl.FRAMEBUFFER, state_app.framebuffers[nextT]);
+                gl.useProgram(progAccum.id);
+                gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, render_camTex);
+                gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, state_app.textures[state_app.currentT]);
+                gl.uniform1i(progAccum.uniforms.camera, 0);
+                gl.uniform1i(progAccum.uniforms.prevSum, 1);
+                gl.uniform1i(progAccum.uniforms.isRecording, state_app.isRecording);
+
+                gl.enableVertexAttribArray(progAccum.attribs.position);
+                gl.bindBuffer(gl.ARRAY_BUFFER, render_quadBuffer);
+                gl.vertexAttribPointer(progAccum.attribs.position, 2, gl.FLOAT, false, 0, 0);
+                gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+                if (state_app.isRecording) state_app.frameCount++;
+                state_app.currentT = nextT;
+            }
+
+            gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+            gl.useProgram(progDisp.id);
+            gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, state_app.textures[state_app.currentT]);
+            gl.uniform1i(progDisp.uniforms.sum, 0);
+            gl.uniform1f(progDisp.uniforms.count, Math.max(state_app.frameCount, 1.0));
+            gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+            ui.status.innerText = ui_formatTime(state_app.elapsedTime, state_app.frameCount);
+            requestAnimationFrame(render_loop);
+
+        };
+
+        /**
+         * Finalizes the stack and saves the requested files.
+         */
+        const io_saveResult = async () => {
+            const frames = state_app.frameCount;
+            const fmt = ui.formatSelect.value;
+            const name = `${state_app.startTimeStr} (${frames}f)`;
+            ui.recordBtn.style.opacity = "0.3";
+
+            if (fmt === fmt_imgTiff || fmt === 'both') {
+                const data = new Float32Array(state_app.width * state_app.height * 4);
+                gl.bindFramebuffer(gl.FRAMEBUFFER, state_app.framebuffers[state_app.currentT]);
+                gl.readPixels(0, 0, state_app.width, state_app.height, gl.RGBA, gl.FLOAT, data);
+                const tiff = io_createTiff16(state_app.width, state_app.height, data, Math.max(frames, 1));
+                const a = document.createElement('a');
+                a.href = URL.createObjectURL(new Blob([tiff], { type: 'image/tiff' }));
+                a.download = name + ".tif"; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+            }
+            if (fmt === fmt_imgCanvas || fmt === 'both') {
+                await io_saveCanvasImage(ui.canvas, name + "." + fmt_imgCanvasType);
+            }
+
+            state_resetToPreview();
+        };
+
+        const render_camTex = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, render_camTex);
+        [gl.TEXTURE_MIN_FILTER, gl.TEXTURE_MAG_FILTER].forEach(f => gl.texParameteri(gl.TEXTURE_2D, f, gl.LINEAR));
+        [gl.TEXTURE_WRAP_S, gl.TEXTURE_WRAP_T].forEach(w => gl.texParameteri(gl.TEXTURE_2D, w, gl.CLAMP_TO_EDGE));
+
+        ui.recordBtn.addEventListener('click', async () => {
+            if (state_app.frameCount > 0 && !state_app.isRecording) return io_saveResult();
+            if (state_app.isRecording) return state_stopAndFreeze();
+            state_app.isRecording = true; state_app.isPaused = false; state_app.frameCount = 0; state_app.elapsedTime = 0;
+            state_app.lastFrameTime = performance.now();
+            state_app.startTimeStr = new Date().toISOString().replace(/T/, ' ').replace(/\..+/, '').replace(/:/g, '-');
+            ui.recordBtn.classList.add('recording'); ui.cancelBtn.style.display = 'block'; ui.pauseBtn.style.display = 'block';
+            state_app.framebuffers.forEach(fb => { gl.bindFramebuffer(gl.FRAMEBUFFER, fb); gl.clear(gl.COLOR_BUFFER_BIT); });
+        });
+
+        ui.pauseBtn.addEventListener('click', () => {
+            state_app.isPaused = !state_app.isPaused; ui.pauseBtn.innerText = state_app.isPaused ? "▶" : "⏸";
+        });
+
+        ui.cancelBtn.addEventListener('click', state_resetToPreview);
+
+    </script>
+</body>
+
+</html>
