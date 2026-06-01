@@ -1,3 +1,3 @@
 # Camera4d(?)
 
-webapp: https://eggnot.github.io/camera4d/camera4d.html
+webapp: https://eggnot.com/camera4d/camera4d.html
